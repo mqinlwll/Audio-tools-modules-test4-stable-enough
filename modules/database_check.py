@@ -272,7 +272,10 @@ def dump_database(db_path: Path, format: str, config):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     
     try:
+        # Use a longer timeout for large databases
         conn = sqlite3.connect(db_path, timeout=config['database']['timeout'])
+        # Enable returning bytestrings as UTF-8 strings when possible
+        conn.text_factory = lambda b: b.decode('utf-8', errors='replace') if isinstance(b, bytes) else b
         cursor = conn.cursor()
 
         # Get all tables in the database
@@ -288,9 +291,26 @@ def dump_database(db_path: Path, format: str, config):
             if format == 'csv':
                 output_file = output_dir / f"{table_name}_{timestamp}.csv"
                 with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-                    writer = csv.writer(csvfile)
+                    writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)  # Quote all fields for better UTF-8 handling
                     writer.writerow(columns)
-                    writer.writerows(rows)
+                    
+                    # Process rows to handle binary and special characters
+                    processed_rows = []
+                    for row in rows:
+                        processed_row = []
+                        for val in row:
+                            if isinstance(val, bytes):
+                                try:
+                                    # Try to decode bytes as UTF-8
+                                    processed_row.append(val.decode('utf-8', errors='replace'))
+                                except (AttributeError, UnicodeDecodeError):
+                                    # Fall back to base64 if it can't be decoded
+                                    processed_row.append(base64.b64encode(val).decode('ascii'))
+                            else:
+                                processed_row.append(val)
+                        processed_rows.append(processed_row)
+                    
+                    writer.writerows(processed_rows)
                 print(f"Dumped {table_name} to {output_file}")
             else:  # json
                 output_file = output_dir / f"{table_name}_{timestamp}.json"
@@ -300,8 +320,13 @@ def dump_database(db_path: Path, format: str, config):
                     row_dict = {}
                     for col, val in zip(columns, row):
                         if isinstance(val, bytes):
-                            # Convert bytes to base64 string for JSON serialization
-                            row_dict[col] = base64.b64encode(val).decode('utf-8')
+                            try:
+                                # Try to decode bytes as UTF-8 first
+                                decoded = val.decode('utf-8', errors='replace')
+                                row_dict[col] = decoded
+                            except (AttributeError, UnicodeDecodeError):
+                                # Fall back to base64 if it can't be decoded
+                                row_dict[col] = base64.b64encode(val).decode('ascii')
                         else:
                             row_dict[col] = val
                     data.append(row_dict)

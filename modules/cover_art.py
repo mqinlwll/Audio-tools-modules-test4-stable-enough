@@ -5,7 +5,7 @@ from tqdm import tqdm
 import utils  # Import from root directory
 
 # Base cover art filenames
-BASE_COVER_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.png']
+BASE_COVER_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.jpeg', 'folder.png']
 
 def rename_file(src: str, dst: str):
     """Rename a file from src to dst."""
@@ -32,11 +32,21 @@ def get_files_to_rename(path: str, hide: bool) -> list:
 def process_cover_art(args):
     """Handle the 'cover-art' command to hide or show cover art files."""
     path = args.path
-    hide = args.hide
+    # Determine action based on args
+    hide = args.hide if hasattr(args, 'hide') else False
+    show = args.show if hasattr(args, 'show') else False
+    
+    if not (hide or show):
+        print("Please specify either --hide or --show option.")
+        return
+        
+    # Set hide flag for get_files_to_rename
+    hide_files = hide and not show
+    
     num_workers = args.workers if args.workers is not None else (os.cpu_count() or 4)
-    files_to_rename = get_files_to_rename(path, hide)
+    files_to_rename = get_files_to_rename(path, hide_files)
     if not files_to_rename:
-        print(f"No cover art files to {'hide' if hide else 'show'} in '{path}'.")
+        print(f"No cover art files to {'hide' if hide_files else 'show'} in '{path}'.")
         return
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(rename_file, src, dst) for src, dst in files_to_rename]
@@ -45,14 +55,19 @@ def process_cover_art(args):
                 future.result()
             except Exception as e:
                 print(f"Error renaming file: {e}")
-    print(f"Cover art {'hidden' if hide else 'shown'} successfully.")
+    print(f"Cover art {'hidden' if hide_files else 'shown'} successfully.")
 
 def register_command(subparsers, config):
     """Register the 'cover-art' command with the subparsers."""
     parser = subparsers.add_parser("cover-art", help="Extract or embed cover art")
     parser.add_argument("path", type=utils.path_type, help="File or directory to process")
-    parser.add_argument("--extract", action="store_true", help="Extract cover art")
-    parser.add_argument("--embed", type=utils.path_type, help="Embed cover art from specified file")
+    
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument("--extract", action="store_true", help="Extract cover art")
+    action_group.add_argument("--embed", type=utils.path_type, help="Embed cover art from specified file")
+    action_group.add_argument("--hide", action="store_true", help="Hide cover art files by adding dot prefix")
+    action_group.add_argument("--show", action="store_true", help="Show hidden cover art files by removing dot prefix")
+    
     parser.add_argument("--output", type=utils.path_type, help="Output directory for extracted cover art")
     parser.add_argument("--workers", type=int, help="Number of worker processes")
     parser.set_defaults(func=handle_cover_art, config=config)
@@ -62,14 +77,22 @@ def handle_cover_art(args):
     path = args.path
     extract = args.extract
     embed = args.embed
+    hide = args.hide
+    show = args.show
     output = args.output
     config = args.config
     
     # Use config values with fallbacks
     num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
     
+    # Handle hide/show operations
+    if hide or show:
+        args.workers = num_workers
+        process_cover_art(args)
+        return
+    
     if not extract and not embed:
-        print("Please specify either --extract or --embed option.")
+        print("Please specify one of --extract, --embed, --hide, or --show options.")
         return
 
     if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
