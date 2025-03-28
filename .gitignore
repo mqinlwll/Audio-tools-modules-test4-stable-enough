@@ -12,3 +12,14 @@ audio-script-config.json
 exports/
 *.db
 *.bak
+test_data/
+test_covers/
+test_intergration/
+*.m4a
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.m4a
+*.mp3
+*.wav

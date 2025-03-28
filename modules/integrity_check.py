@@ -149,6 +149,22 @@ def cleanup_database(db_path: Path):
     finally:
         release_lock(lock_fd)
 
+def check_file_integrity(file_path: str) -> dict:
+    """Check the integrity of a single audio file and return a dictionary with the results."""
+    try:
+        status, message, _ = check_single_file(file_path)
+        return {
+            'file_path': file_path,
+            'ok': status == "PASSED",
+            'error': message if status == "FAILED" else ""
+        }
+    except Exception as e:
+        return {
+            'file_path': file_path,
+            'ok': False,
+            'error': str(e)
+        }
+
 def register_command(subparsers, config):
     """Register the 'check' command with the subparsers."""
     parser = subparsers.add_parser("check", help="Check audio file integrity")

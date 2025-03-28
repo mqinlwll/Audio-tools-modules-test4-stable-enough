@@ -3,6 +3,8 @@ from pathlib import Path
 import concurrent.futures
 from tqdm import tqdm
 import utils  # Import from root directory
+from mutagen import File as MutagenFile
+import shutil
 
 # Base cover art filenames
 BASE_COVER_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.jpeg', 'folder.png']
@@ -133,3 +135,97 @@ def handle_cover_art(args):
                     if result:
                         print(f"Embedded cover art in {result}")
                     pbar.update(1)
+
+def extract_cover(audio_file: str, output_dir: str) -> str:
+    """Extract cover art from audio file to the specified output directory.
+    
+    Returns the audio file path if successful, None otherwise.
+    """
+    try:
+        audio = MutagenFile(audio_file)
+        if not audio:
+            return None
+            
+        # File name for the extracted cover art
+        base_name = os.path.splitext(os.path.basename(audio_file))[0]
+        cover_path = os.path.join(output_dir, f"{base_name}_cover.jpg")
+        
+        # Extract cover art based on file format
+        if hasattr(audio, 'pictures') and audio.pictures:  # FLAC, OGG, etc.
+            with open(cover_path, 'wb') as f:
+                f.write(audio.pictures[0].data)
+            return audio_file
+        elif audio.tags and 'APIC:' in audio.tags:  # MP3
+            with open(cover_path, 'wb') as f:
+                f.write(audio.tags['APIC:'].data)
+            return audio_file
+        elif audio.tags and 'covr' in audio.tags:  # M4A
+            with open(cover_path, 'wb') as f:
+                f.write(audio.tags['covr'][0])
+            return audio_file
+    except Exception as e:
+        print(f"Error extracting cover art from {audio_file}: {e}")
+    
+    return None
+
+def embed_cover(audio_file: str, cover_file: str) -> str:
+    """Embed cover art into the audio file.
+    
+    Returns the audio file path if successful, None otherwise.
+    """
+    try:
+        # Create backup
+        backup_file = audio_file + ".bak"
+        shutil.copy2(audio_file, backup_file)
+        
+        audio = MutagenFile(audio_file)
+        if not audio:
+            return None
+            
+        with open(cover_file, 'rb') as f:
+            cover_data = f.read()
+            
+        # Determine mime type based on cover file extension
+        mime_type = "image/jpeg"  # Default
+        if cover_file.lower().endswith('.png'):
+            mime_type = "image/png"
+            
+        # Embed cover art based on file format
+        if hasattr(audio, 'add_picture'):  # FLAC
+            from mutagen.flac import Picture
+            pic = Picture()
+            pic.data = cover_data
+            pic.type = 3  # Cover (front)
+            pic.mime = mime_type
+            pic.desc = "Cover"
+            audio.add_picture(pic)
+            audio.save()
+            return audio_file
+        elif audio.tags and hasattr(audio.tags, 'add'):  # MP3
+            from mutagen.id3 import APIC
+            audio.tags.add(
+                APIC(
+                    encoding=3,  # UTF-8
+                    mime=mime_type,
+                    type=3,  # Cover (front)
+                    desc='Cover',
+                    data=cover_data
+                )
+            )
+            audio.save()
+            return audio_file
+        elif hasattr(audio.tags, 'setdefault'):  # M4A
+            audio.tags.setdefault('covr', [])
+            audio.tags['covr'] = [cover_data]
+            audio.save()
+            return audio_file
+            
+        # Restore backup if we get here (didn't update the cover)
+        shutil.move(backup_file, audio_file)
+    except Exception as e:
+        print(f"Error embedding cover art in {audio_file}: {e}")
+        # Restore backup if an exception occurs
+        if os.path.exists(backup_file):
+            shutil.move(backup_file, audio_file)
+    
+    return None
