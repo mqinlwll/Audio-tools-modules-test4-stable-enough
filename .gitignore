@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+env/
+venv/
+.DS_Store
+Logs/
+modules/__pycache__/
+cache log/
+audio-script-config.json
+*.lock
+*.json
