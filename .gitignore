@@ -10,3 +10,5 @@ audio-script-config.json
 *.lock
 *.json
 exports/
+*.db
+*.bak
