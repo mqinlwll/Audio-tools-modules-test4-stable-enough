@@ -124,9 +124,66 @@ def count_command(args):
     else:
         print("Invalid option. Use 'album', 'song', or 'size'.")
 
-def register_command(subparsers):
-    """Register the 'count' command with the CLI subparsers."""
-    count_parser = subparsers.add_parser("count", help="Count albums, songs, or calculate sizes based on metadata")
-    count_parser.add_argument("option", choices=["album", "song", "size"], help="Choose what to count: albums, songs, or sizes")
-    count_parser.add_argument("directories", nargs='+', type=utils.directory_path, help="One or more directories to process")
-    count_parser.set_defaults(func=count_command)
+def register_command(subparsers, config):
+    """Register the 'count' command with the subparsers."""
+    parser = subparsers.add_parser("count", help="Count albums in a directory")
+    parser.add_argument("path", type=utils.path_type, help="Directory to process")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed information")
+    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    parser.set_defaults(func=count_albums, config=config)
+
+def count_albums(args):
+    """Handle the 'album-counter' command."""
+    path = args.path
+    verbose = args.verbose
+    config = args.config
+    
+    # Use config values with fallbacks
+    num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
+    
+    if not os.path.isdir(path):
+        print(f"'{path}' is not a directory.")
+        return
+
+    # Get all audio files
+    audio_files = utils.get_audio_files(path)
+    if not audio_files:
+        print(f"No audio files found in '{path}'.")
+        return
+
+    # Process files
+    albums = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_file, file) for file in audio_files]
+        with tqdm(total=len(futures), desc="Processing files") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    album_key = (result['artist'], result['album'])
+                    if album_key not in albums:
+                        albums[album_key] = {
+                            'artist': result['artist'],
+                            'album': result['album'],
+                            'tracks': 0,
+                            'files': []
+                        }
+                    albums[album_key]['tracks'] += 1
+                    albums[album_key]['files'].append(result['file_path'])
+                pbar.update(1)
+
+    # Print results
+    if verbose:
+        print("\nDetailed Album Information:")
+        for album in albums.values():
+            print(f"\nArtist: {album['artist']}")
+            print(f"Album: {album['album']}")
+            print(f"Track Count: {album['tracks']}")
+            print("Files:")
+            for file in album['files']:
+                print(f"  {file}")
+    else:
+        print("\nAlbum Summary:")
+        for album in albums.values():
+            print(f"{album['artist']} - {album['album']}: {album['tracks']} tracks")
+
+    print(f"\nTotal Albums: {len(albums)}")

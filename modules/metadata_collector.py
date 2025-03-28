@@ -27,10 +27,10 @@ def release_lock(lock_fd):
     lock_fd.close()
 
 ### Database Initialization ###
-def initialize_database(db_path: Path):
+def initialize_database(db_path: Path, timeout: int):
     """Initialize the SQLite database with WAL mode and busy timeout."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=5)
+    conn = sqlite3.connect(db_path, timeout=timeout)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute('''
@@ -155,7 +155,7 @@ def extract_metadata(file_path: str) -> dict:
     return metadata
 
 ### Action Determination ###
-def determine_action(db_path: Path, file_path: str, force_recheck: bool = False) -> tuple:
+def determine_action(db_path: Path, file_path: str, force_recheck: bool = False, timeout: int = 5) -> tuple:
     """Determine if metadata needs to be extracted based on file mtime."""
     try:
         current_mtime = os.path.getmtime(file_path)
@@ -164,7 +164,7 @@ def determine_action(db_path: Path, file_path: str, force_recheck: bool = False)
 
     lock_fd = acquire_lock(LOCK_FILE)
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
+        conn = sqlite3.connect(db_path, timeout=timeout)
         cursor = conn.cursor()
         cursor.execute("SELECT last_checked FROM audio_metadata WHERE file_path = ?", (file_path,))
         result = cursor.fetchone()
@@ -179,9 +179,9 @@ def determine_action(db_path: Path, file_path: str, force_recheck: bool = False)
         release_lock(lock_fd)
 
 ### File Processing ###
-def process_file(db_path: Path, file_path: str, force_recheck: bool = False) -> tuple:
+def process_file(db_path: Path, file_path: str, force_recheck: bool = False, timeout: int = 5) -> tuple:
     """Process a file to extract and store metadata."""
-    action, current_mtime = determine_action(db_path, file_path, force_recheck)
+    action, current_mtime = determine_action(db_path, file_path, force_recheck, timeout)
     if action == 'USE_CACHED':
         return 'USE_CACHED', None
     elif action == 'EXTRACT_METADATA':
@@ -212,11 +212,11 @@ def process_file(db_path: Path, file_path: str, force_recheck: bool = False) -> 
     return 'ERROR', 'Unknown action'
 
 ### Database Cleanup ###
-def cleanup_database(db_path: Path):
+def cleanup_database(db_path: Path, timeout: int):
     """Remove database entries for files that no longer exist."""
     lock_fd = acquire_lock(LOCK_FILE)
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
+        conn = sqlite3.connect(db_path, timeout=timeout)
         cursor = conn.cursor()
         cursor.execute("SELECT file_path FROM audio_metadata")
         for (file_path,) in cursor.fetchall():
@@ -228,24 +228,42 @@ def cleanup_database(db_path: Path):
         release_lock(lock_fd)
 
 ### Export Functionality ###
-def export_database(db_path: Path, format: str, output_file: str):
+def export_database(db_path: Path, format: str, output_file: str, timeout: int):
     """Export the database to CSV or JSON."""
     lock_fd = acquire_lock(LOCK_FILE)
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
+        conn = sqlite3.connect(db_path, timeout=timeout)
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM audio_metadata")
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
+        
+        # Convert binary data to strings and ensure proper UTF-8 handling
+        processed_rows = []
+        for row in rows:
+            processed_row = []
+            for value in row:
+                if isinstance(value, bytes):
+                    try:
+                        processed_row.append(value.decode('utf-8'))
+                    except UnicodeDecodeError:
+                        processed_row.append('[Binary Data]')
+                elif isinstance(value, str):
+                    # Ensure string is properly decoded UTF-8
+                    processed_row.append(value)
+                else:
+                    processed_row.append(value)
+            processed_rows.append(processed_row)
+        
         if format == 'csv':
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(columns)
-                writer.writerows(rows)
+                writer.writerows(processed_rows)
         elif format == 'json':
-            data = [dict(zip(columns, row)) for row in rows]
+            data = [dict(zip(columns, row)) for row in processed_rows]
             with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4, ensure_ascii=False)
         conn.close()
     finally:
         release_lock(lock_fd)
@@ -258,13 +276,29 @@ def collect_metadata(args):
     summary = args.summary
     force_recheck = args.recheck
     export_format = args.export
-    num_workers = args.workers if args.workers is not None else (os.cpu_count() or 4)
-    config = utils.load_config()
-
+    config = args.config  # Get config from args
+    
+    # Use config values with fallbacks
+    num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
     cache_folder = Path(config.get("cache_folder", "cache log"))
-    db_path = cache_folder / "metadata.db"
+    db_path = Path(config['database']['path'])
+    db_timeout = config['database']['timeout']
+    export_dir = Path(config['export']['output_dir'])
 
-    initialize_database(db_path)
+    # If only export is specified without path, just export and exit
+    if export_format and not path:
+        if not db_path.exists():
+            print(f"No metadata database found at {db_path}")
+            return
+        # Create export directory if it doesn't exist
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        output_file = export_dir / f"metadata_export_{timestamp}.{export_format}"
+        export_database(db_path, export_format, output_file, db_timeout)
+        print(f"Metadata exported to {output_file}")
+        return
+
+    initialize_database(db_path, db_timeout)
 
     # Get audio files
     if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
@@ -286,7 +320,7 @@ def collect_metadata(args):
     if verbose:
         # Sequential processing for verbose output
         for file_path in audio_files:
-            action, result = process_file(db_path, file_path, force_recheck)
+            action, result = process_file(db_path, file_path, force_recheck, db_timeout)
             if action == 'USE_CACHED':
                 cached_count += 1
                 print(f"Cached: {file_path}")
@@ -294,12 +328,12 @@ def collect_metadata(args):
                 extracted_count += 1
                 data = result
                 print(f"Extracted: {file_path}")
-                for key, value in zip([desc[0] for desc in sqlite3.connect(db_path).cursor().execute("PRAGMA table_info(audio_metadata)").fetchall()], data):
+                for key, value in zip([desc[0] for desc in sqlite3.connect(db_path, timeout=db_timeout).cursor().execute("PRAGMA table_info(audio_metadata)").fetchall()], data):
                     if key != 'file_path' and key != 'last_checked':
                         print(f"  {key}: {value}")
                 lock_fd = acquire_lock(LOCK_FILE)
                 try:
-                    conn = sqlite3.connect(db_path, timeout=5)
+                    conn = sqlite3.connect(db_path, timeout=db_timeout)
                     cursor = conn.cursor()
                     cursor.execute('''
                         INSERT OR REPLACE INTO audio_metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -315,7 +349,7 @@ def collect_metadata(args):
         # Concurrent processing
         extracted_data = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(process_file, db_path, file, force_recheck) for file in audio_files]
+            futures = [executor.submit(process_file, db_path, file, force_recheck, db_timeout) for file in audio_files]
             with tqdm(total=len(futures), desc="Processing files") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     action, result = future.result()
@@ -332,7 +366,7 @@ def collect_metadata(args):
         if extracted_data:
             lock_fd = acquire_lock(LOCK_FILE)
             try:
-                conn = sqlite3.connect(db_path, timeout=5)
+                conn = sqlite3.connect(db_path, timeout=db_timeout)
                 cursor = conn.cursor()
                 cursor.executemany('''
                     INSERT OR REPLACE INTO audio_metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -343,11 +377,12 @@ def collect_metadata(args):
                 release_lock(lock_fd)
 
     # Cleanup and export
-    cleanup_database(db_path)
+    cleanup_database(db_path, db_timeout)
     if export_format:
+        export_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        output_file = f"metadata_export_{timestamp}.{export_format}"
-        export_database(db_path, export_format, output_file)
+        output_file = export_dir / f"metadata_export_{timestamp}.{export_format}"
+        export_database(db_path, export_format, output_file, db_timeout)
         print(f"Metadata exported to {output_file}")
 
     # Summary
@@ -355,16 +390,16 @@ def collect_metadata(args):
         print(f"\nSummary:\nTotal files: {total_files}\nExtracted: {extracted_count}\nCached: {cached_count}\nErrors: {error_count}")
 
 ### Command Registration ###
-def register_command(subparsers):
+def register_command(subparsers, config):
     """Register the 'metadata' command with the subparsers."""
     parser = subparsers.add_parser("metadata", help="Collect audio file metadata")
-    parser.add_argument("path", type=utils.path_type, help="File or directory to process")
+    parser.add_argument("path", type=utils.path_type, nargs='?', help="File or directory to process")
     parser.add_argument("--verbose", action="store_true", help="Print detailed metadata")
     parser.add_argument("--summary", action="store_true", help="Show summary only")
     parser.add_argument("--recheck", action="store_true", help="Force re-extraction of metadata")
     parser.add_argument("--export", choices=['csv', 'json'], help="Export metadata to CSV or JSON")
     parser.add_argument("--workers", type=int, help="Number of worker processes")
-    parser.set_defaults(func=collect_metadata)
+    parser.set_defaults(func=collect_metadata, config=config)
 
 if __name__ == "__main__":
     # For testing purposes

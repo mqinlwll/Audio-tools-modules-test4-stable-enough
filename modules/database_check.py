@@ -231,64 +231,99 @@ def quick_check_database(db_path: Path):
     print(f"Passed: {passed_count} ({(passed_count/total)*100:.1f}% if total > 0 else 0)")
     print(f"Failed: {failed_count} ({(failed_count/total)*100:.1f}% if total > 0 else 0)")
 
-def check_database(args):
-    """Handle the 'dbcheck' command to inspect the database."""
-    config = utils.load_config()
-    cache_folder = Path(config.get("cache_folder", "cache log"))
-    db_path = cache_folder / "integrity_check.db"
-
-    verbose = getattr(args, 'verbose', False)
-    verify = getattr(args, 'verify', False)
-    export_csv = getattr(args, 'csv', False)
-    export_json = getattr(args, 'json', False)
-    filter_status = getattr(args, 'filter', 'all')
-    update_db = getattr(args, 'update', False)
-    watch = getattr(args, 'watch', False)  # New watch flag
-    quick_check = getattr(args, 'check', False)  # New check flag
-
-    # Generate export filenames if requested
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    csv_file = f"dbcheck-{filter_status}-{timestamp}.csv" if export_csv else None
-    json_file = f"dbcheck-{filter_status}-{timestamp}.json" if export_json else None
-
-    print(f"Checking database at: {db_path}")
-    if not check_database_exists(db_path):
-        print(f"Error: Database '{db_path}' does not exist.")
-        return
-
-    if watch:
-        watch_database(db_path)
-        return
-
-    if quick_check:
-        quick_check_database(db_path)
-        return
-
-    if update_db:
-        update_database_schema(db_path)
-
-    passed_count, failed_count, error = get_database_summary(db_path)
-    if error:
-        print(error)
-        return
-
-    print(f"Initial summary - Passed: {passed_count}, Failed: {failed_count}")
-    list_database_entries(db_path, verbose=verbose, verify=verify, export_csv=csv_file, export_json=json_file, filter_status=filter_status)
-    print("Database check complete.")
-
-def register_command(subparsers):
+def register_command(subparsers, config):
     """Register the 'dbcheck' command with the subparsers."""
-    dbcheck_parser = subparsers.add_parser("dbcheck", help="Check the integrity database contents")
-    dbcheck_parser.add_argument("--verbose", action="store_true", help="List all database entries")
-    dbcheck_parser.add_argument("--verify", action="store_true", help="Verify file existence and hashes")
-    dbcheck_parser.add_argument("--csv", action="store_true", help="Export results to a CSV file")
-    dbcheck_parser.add_argument("--json", action="store_true", help="Export results to a JSON file")
-    dbcheck_parser.add_argument("--filter", choices=['all', 'passed', 'failed'], default='all',
-                                help="Filter export: 'all' (default), 'passed', or 'failed'")
-    dbcheck_parser.add_argument("--update", action="store_true", help="Update database schema for compatibility")
-    dbcheck_parser.add_argument("--watch", action="store_true", help="Watch database for real-time updates")
-    dbcheck_parser.add_argument("--check", action="store_true", help="Quick check of database entry counts")
-    dbcheck_parser.set_defaults(func=check_database)
+    parser = subparsers.add_parser("dbcheck", help="Check database integrity")
+    parser.add_argument("--repair", action="store_true", help="Attempt to repair database issues")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed information")
+    parser.set_defaults(func=check_database, config=config)
+
+def check_database(args):
+    """Handle the 'database-check' command."""
+    repair = args.repair
+    verbose = args.verbose
+    config = args.config
+    
+    # Get database path from config
+    db_path = Path(config['database']['path'])
+    db_timeout = config['database']['timeout']
+    
+    if not db_path.exists():
+        print(f"Database not found at {db_path}")
+        return
+    
+    # Check database integrity
+    issues = []
+    try:
+        conn = sqlite3.connect(db_path, timeout=db_timeout)
+        cursor = conn.cursor()
+        
+        # Check table structure
+        cursor.execute("PRAGMA table_info(audio_metadata)")
+        columns = [col[1] for col in cursor.fetchall()]
+        expected_columns = [
+            'file_path', 'track_number', 'disc_number', 'track_total',
+            'disc_total', 'codec', 'sample_rate', 'bitrate', 'bit_depth',
+            'channels', 'artist', 'album', 'album_artist', 'title',
+            'isrc', 'upc', 'date', 'last_checked'
+        ]
+        
+        if set(columns) != set(expected_columns):
+            issues.append("Table structure mismatch")
+        
+        # Check for missing files
+        cursor.execute("SELECT file_path FROM audio_metadata")
+        for (file_path,) in cursor.fetchall():
+            if not os.path.exists(file_path):
+                issues.append(f"Missing file: {file_path}")
+        
+        # Check for invalid data
+        cursor.execute("SELECT file_path, sample_rate, bitrate FROM audio_metadata")
+        for file_path, sample_rate, bitrate in cursor.fetchall():
+            if sample_rate is not None and (sample_rate <= 0 or sample_rate > 1000000):
+                issues.append(f"Invalid sample rate in {file_path}: {sample_rate}")
+            if bitrate is not None and (bitrate <= 0 or bitrate > 10000000):
+                issues.append(f"Invalid bitrate in {file_path}: {bitrate}")
+        
+        conn.close()
+        
+    except sqlite3.Error as e:
+        issues.append(f"Database error: {str(e)}")
+    
+    # Print results
+    if verbose:
+        print("\nDetailed Database Check:")
+        if issues:
+            print("\nIssues found:")
+            for issue in issues:
+                print(f"  - {issue}")
+        else:
+            print("\nNo issues found.")
+    else:
+        print(f"\nDatabase check complete. Found {len(issues)} issues.")
+    
+    # Repair if requested
+    if repair and issues:
+        print("\nAttempting repairs...")
+        try:
+            conn = sqlite3.connect(db_path, timeout=db_timeout)
+            cursor = conn.cursor()
+            
+            # Remove entries for missing files
+            cursor.execute("SELECT file_path FROM audio_metadata")
+            for (file_path,) in cursor.fetchall():
+                if not os.path.exists(file_path):
+                    cursor.execute("DELETE FROM audio_metadata WHERE file_path = ?", (file_path,))
+            
+            # Fix invalid data
+            cursor.execute("UPDATE audio_metadata SET sample_rate = NULL WHERE sample_rate <= 0 OR sample_rate > 1000000")
+            cursor.execute("UPDATE audio_metadata SET bitrate = NULL WHERE bitrate <= 0 OR bitrate > 10000000")
+            
+            conn.commit()
+            conn.close()
+            print("Repairs completed successfully.")
+        except sqlite3.Error as e:
+            print(f"Error during repair: {str(e)}")
 
 if __name__ == "__main__":
     # This is just for standalone testing - typically this would be part of a larger script

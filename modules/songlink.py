@@ -2,6 +2,9 @@ import requests
 import json
 from colorama import Fore, Style, init
 import utils  # Assuming a utils module exists in the project root
+import os
+import concurrent.futures
+from tqdm import tqdm
 
 # Initialize colorama for colored output
 init(autoreset=True)
@@ -74,44 +77,43 @@ def normalize_service_name(service):
     color = service_colors.get(service, Fore.WHITE)
     return color + service.replace("_", " ").title() + Style.RESET_ALL
 
-def songlink_command(args):
-    """Handle the 'songlink' command to fetch and display song links."""
-    selected_services = {s.strip().lower().replace(' ', '_') for s in args.select} if args.select else None
-    output_file = open(args.output, 'w') if args.output else None
+def register_command(subparsers, config):
+    """Register the 'songlink' command with the subparsers."""
+    parser = subparsers.add_parser("songlink", help="Generate song links")
+    parser.add_argument("path", type=utils.path_type, help="File or directory to process")
+    parser.add_argument("--output", type=utils.path_type, help="Output directory for song links")
+    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    parser.set_defaults(func=handle_songlink, config=config)
 
-    try:
-        urls = []
-        if args.file:
-            with open(args.file, 'r') as f:
-                urls = [line.strip() for line in f if line.strip()]
-        else:
-            urls = [args.url]
+def handle_songlink(args):
+    """Handle the 'songlink' command."""
+    path = args.path
+    output = args.output
+    config = args.config
+    
+    # Use config values with fallbacks
+    num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
+    
+    if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
+        audio_files = [path]
+    elif os.path.isdir(path):
+        audio_files = utils.get_audio_files(path)
+        if not audio_files:
+            print(f"No audio files found in '{path}'.")
+            return
+    else:
+        print(f"'{path}' is not a file or directory.")
+        return
 
-        for url in urls:
-            links = fetch_links(url, args.country, args.songIfSingle)
-            if not links:
-                print(f"{Fore.YELLOW}No links found for {url}")
-                continue
-
-            filtered_links = print_links(url, links, selected_services)
-
-            if output_file and filtered_links:
-                for info in filtered_links.values():
-                    output_file.write(f"{info['url']}\n")
-
-    finally:
-        if output_file:
-            output_file.close()
-
-def register_command(subparsers):
-    """Register the 'songlink' command with the CLI subparsers."""
-    songlink_parser = subparsers.add_parser("songlink", help="Fetch song links from Odesli API")
-    group = songlink_parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--url', type=str, help="Single song URL")
-    group.add_argument('--file', type=str, help="Text file containing URLs")
-
-    songlink_parser.add_argument('--country', type=str, help="User country code")
-    songlink_parser.add_argument('--songIfSingle', action='store_true', help="Treat singles as songs")
-    songlink_parser.add_argument('--select', '-s', nargs='+', help="Services to save (e.g., tidal)")
-    songlink_parser.add_argument('--output', '-o', type=str, help="Output file to save links")
-    songlink_parser.set_defaults(func=songlink_command)
+    if not output:
+        output = os.path.join(os.path.dirname(path), "song_links")
+    os.makedirs(output, exist_ok=True)
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(create_songlink, file, output) for file in audio_files]
+        with tqdm(total=len(futures), desc="Creating song links") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    print(f"Created song link for {result}")
+                pbar.update(1)

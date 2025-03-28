@@ -47,11 +47,66 @@ def process_cover_art(args):
                 print(f"Error renaming file: {e}")
     print(f"Cover art {'hidden' if hide else 'shown'} successfully.")
 
-def register_command(subparsers):
+def register_command(subparsers, config):
     """Register the 'cover-art' command with the subparsers."""
-    cover_parser = subparsers.add_parser("cover-art", help="Hide or show cover art files")
-    cover_group = cover_parser.add_mutually_exclusive_group(required=True)
-    cover_group.add_argument("--hide", action="store_true", help="Hide cover art by adding a dot prefix")
-    cover_group.add_argument("--show", action="store_true", help="Show cover art by removing dot prefix")
-    cover_parser.add_argument("path", type=utils.directory_path, help="Directory to process")
-    cover_parser.set_defaults(func=process_cover_art)
+    parser = subparsers.add_parser("cover-art", help="Extract or embed cover art")
+    parser.add_argument("path", type=utils.path_type, help="File or directory to process")
+    parser.add_argument("--extract", action="store_true", help="Extract cover art")
+    parser.add_argument("--embed", type=utils.path_type, help="Embed cover art from specified file")
+    parser.add_argument("--output", type=utils.path_type, help="Output directory for extracted cover art")
+    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    parser.set_defaults(func=handle_cover_art, config=config)
+
+def handle_cover_art(args):
+    """Handle the 'cover-art' command."""
+    path = args.path
+    extract = args.extract
+    embed = args.embed
+    output = args.output
+    config = args.config
+    
+    # Use config values with fallbacks
+    num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
+    
+    if not extract and not embed:
+        print("Please specify either --extract or --embed option.")
+        return
+
+    if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
+        audio_files = [path]
+    elif os.path.isdir(path):
+        audio_files = utils.get_audio_files(path)
+        if not audio_files:
+            print(f"No audio files found in '{path}'.")
+            return
+    else:
+        print(f"'{path}' is not a file or directory.")
+        return
+
+    if extract:
+        if not output:
+            output = os.path.join(os.path.dirname(path), "cover_art")
+        os.makedirs(output, exist_ok=True)
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(extract_cover, file, output) for file in audio_files]
+            with tqdm(total=len(futures), desc="Extracting cover art") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    if result:
+                        print(f"Extracted cover art from {result}")
+                    pbar.update(1)
+    
+    if embed:
+        if not os.path.isfile(embed):
+            print(f"Cover art file '{embed}' not found.")
+            return
+            
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(embed_cover, file, embed) for file in audio_files]
+            with tqdm(total=len(futures), desc="Embedding cover art") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    if result:
+                        print(f"Embedded cover art in {result}")
+                    pbar.update(1)

@@ -1,6 +1,8 @@
 import argparse
 import importlib
 from pathlib import Path
+import sys
+import utils
 
 def print_logo():
     """Print ASCII logo for AUDIO TOOL"""
@@ -16,11 +18,22 @@ def print_logo():
 
 def main():
     """Set up CLI and dynamically register commands from modules."""
+    # Load configuration first
+    config = utils.load_config()
+    
     parser = argparse.ArgumentParser(
         description="Tool for managing audio files",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    
+    # Add global options from config
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=config['processing']['max_workers'],
+        help="Number of worker processes (default: CPU count)"
+    )
+    
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Dynamically import and register modules from the 'modules' directory
@@ -31,7 +44,7 @@ def main():
             try:
                 module = importlib.import_module(module_name)
                 if hasattr(module, 'register_command'):
-                    module.register_command(subparsers)
+                    module.register_command(subparsers, config)
                 else:
                     print(f"Warning: Module {module_name} does not have a 'register_command' function.")
             except ImportError as e:
@@ -55,7 +68,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        import sys  # Added missing import
         main()
     except KeyboardInterrupt:
         print("Quitting job...")

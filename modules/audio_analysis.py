@@ -5,6 +5,7 @@ import concurrent.futures
 from tqdm import tqdm
 import datetime
 import utils  # Import from root directory
+import os
 
 def analyze_single_file(file_path: str) -> str:
     """Analyze metadata of a single audio file using ffprobe."""
@@ -47,21 +48,18 @@ def analyze_single_file(file_path: str) -> str:
         return f"Analyzing: {file_path}\n  [ERROR] Failed to analyze: {e}\n\n"
 
 def analyze_audio(args):
-    """Handle the 'info' command to analyze audio file metadata."""
-    if not utils.is_ffprobe_installed():
-        print("Error: ffprobe is not installed or not in your PATH.")
-        return
-
+    """Handle the 'audio-analysis' command."""
     path = args.path
-    output = args.output
     verbose = args.verbose
-    num_workers = args.workers if args.workers is not None else (os.cpu_count() or 4)
-
-    # Determine files to analyze
+    config = args.config
+    
+    # Use config values with fallbacks
+    num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
+    
     if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
-        audio_files = [Path(path)]
+        audio_files = [path]
     elif os.path.isdir(path):
-        audio_files = [file for ext in utils.AUDIO_EXTENSIONS for file in Path(path).rglob(f"*{ext}")]
+        audio_files = utils.get_audio_files(path)
         if not audio_files:
             print(f"No audio files found in '{path}'.")
             return
@@ -69,24 +67,59 @@ def analyze_audio(args):
         print(f"'{path}' is not a file or directory.")
         return
 
-    if verbose:
-        # Sequential analysis with console output
-        for audio_file in audio_files:
-            print(analyze_single_file(str(audio_file)))
-    else:
-        # Parallel analysis with file output
-        output_file = f"audio_analysis_{datetime.datetime.now().strftime('%Y%m%d')}.txt" if output == "audio_analysis.txt" else output
-        with open(output_file, "w") as f:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(analyze_single_file, str(file)) for file in audio_files]
-                for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Analyzing audio"):
-                    f.write(future.result())
-        print(f"Analysis complete. Results saved to '{output_file}'")
+    # Process files
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(analyze_file, file) for file in audio_files]
+        with tqdm(total=len(futures), desc="Analyzing files") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    results.append(result)
+                pbar.update(1)
 
-def register_command(subparsers):
-    """Register the 'info' command with the subparsers."""
-    info_parser = subparsers.add_parser("info", help="Analyze audio file metadata")
-    info_parser.add_argument("path", type=utils.path_type, help="File or directory to analyze")
-    info_parser.add_argument("-o", "--output", default="audio_analysis.txt", help="Output file for results")
-    info_parser.add_argument("--verbose", action="store_true", help="Print results to console (no parallelism)")
-    info_parser.set_defaults(func=analyze_audio)
+    # Print results
+    if verbose:
+        print("\nDetailed Audio Analysis:")
+        for result in results:
+            print(f"\nFile: {result['file_path']}")
+            print(f"Format: {result['format']}")
+            print(f"Sample Rate: {result['sample_rate']} Hz")
+            print(f"Bit Depth: {result['bit_depth']} bits")
+            print(f"Channels: {result['channels']}")
+            print(f"Duration: {result['duration']:.2f} seconds")
+            print(f"Bitrate: {result['bitrate']/1000:.2f} kbps")
+    else:
+        print("\nAudio Analysis Summary:")
+        print(f"Total Files: {len(results)}")
+        formats = {}
+        sample_rates = {}
+        bit_depths = {}
+        channels = {}
+        
+        for result in results:
+            formats[result['format']] = formats.get(result['format'], 0) + 1
+            sample_rates[result['sample_rate']] = sample_rates.get(result['sample_rate'], 0) + 1
+            bit_depths[result['bit_depth']] = bit_depths.get(result['bit_depth'], 0) + 1
+            channels[result['channels']] = channels.get(result['channels'], 0) + 1
+        
+        print("\nFormats:")
+        for fmt, count in formats.items():
+            print(f"  {fmt}: {count}")
+        print("\nSample Rates:")
+        for rate, count in sample_rates.items():
+            print(f"  {rate} Hz: {count}")
+        print("\nBit Depths:")
+        for depth, count in bit_depths.items():
+            print(f"  {depth} bits: {count}")
+        print("\nChannels:")
+        for ch, count in channels.items():
+            print(f"  {ch}: {count}")
+
+def register_command(subparsers, config):
+    """Register the 'analyze' command with the subparsers."""
+    parser = subparsers.add_parser("analyze", help="Analyze audio files")
+    parser.add_argument("path", type=utils.path_type, help="File or directory to process")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed information")
+    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    parser.set_defaults(func=analyze_audio, config=config)

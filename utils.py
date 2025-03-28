@@ -1,6 +1,6 @@
 import os
 import shutil
-import json
+import yaml
 from pathlib import Path
 import argparse
 
@@ -8,17 +8,34 @@ import argparse
 AUDIO_EXTENSIONS = ['.flac', '.wav', '.m4a', '.mp3', '.ogg', '.opus', '.ape', '.wv', '.wma']
 
 # Configuration file path
-CONFIG_FILE = Path("audio-script-config.json")
+CONFIG_FILE = Path("audio-script-config.yaml")
 
 def load_config():
-    """Load configuration from JSON file or create a default one if it doesn't exist."""
+    """Load configuration from YAML file or create a default one if it doesn't exist."""
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
     else:
-        default_config = {"log_folder": "Logs"}
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(default_config, f, indent=4)
+        default_config = {
+            "log_folder": "Logs",
+            "cache_folder": "cache log",
+            "database": {
+                "path": "cache log/metadata.db",
+                "timeout": 5
+            },
+            "export": {
+                "default_format": "json",
+                "output_dir": "exports"
+            },
+            "processing": {
+                "max_workers": None,  # Will use CPU count if None
+                "chunk_size": 1024
+            }
+        }
+        # Create parent directory if it doesn't exist
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump(default_config, f, default_flow_style=False, allow_unicode=True)
         return default_config
 
 def get_audio_files(directory: str) -> list:

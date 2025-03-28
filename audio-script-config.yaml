@@ -1,0 +1,32 @@
+# Audio Tool Configuration
+
+# Logging settings
+log_folder: "Logs"
+
+# Cache and database settings
+cache_folder: "cache log"
+database:
+  path: "cache log/metadata.db"
+  timeout: 5
+
+# Export settings
+export:
+  default_format: "json"
+  output_dir: "exports"
+
+# Processing settings
+processing:
+  max_workers: null  # Will use CPU count if null
+  chunk_size: 1024
+
+# Supported audio formats
+audio_extensions:
+  - .flac
+  - .wav
+  - .m4a
+  - .mp3
+  - .ogg
+  - .opus
+  - .ape
+  - .wv
+  - .wma 
