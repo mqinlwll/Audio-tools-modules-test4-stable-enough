@@ -9,3 +9,4 @@ cache log/
 audio-script-config.json
 *.lock
 *.json
+exports/

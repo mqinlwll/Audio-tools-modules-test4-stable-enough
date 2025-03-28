@@ -8,6 +8,7 @@ import csv
 import json
 import time  # Added for watch functionality
 import utils  # Import from root directory
+import base64
 
 def calculate_file_hash(file_path: str) -> str:
     """Calculate the MD5 hash of a file."""
@@ -232,21 +233,112 @@ def quick_check_database(db_path: Path):
     print(f"Failed: {failed_count} ({(failed_count/total)*100:.1f}% if total > 0 else 0)")
 
 def register_command(subparsers, config):
-    """Register the 'dbcheck' command with the subparsers."""
-    parser = subparsers.add_parser("dbcheck", help="Check database integrity")
+    """Register the 'db' command with the subparsers."""
+    parser = subparsers.add_parser("db", help="Check database integrity")
     parser.add_argument("--repair", action="store_true", help="Attempt to repair database issues")
     parser.add_argument("--verbose", action="store_true", help="Print detailed information")
+    parser.add_argument("--list", action="store_true", help="List available databases")
+    parser.add_argument("--dump", choices=['csv', 'json'], help="Dump database to CSV or JSON format")
+    parser.add_argument("--db-name", help="Specify which database to operate on (e.g., 'metadata' or 'integrity_check')")
     parser.set_defaults(func=check_database, config=config)
 
+def list_databases(config):
+    """List all available databases in the configured directory."""
+    db_dir = Path(config['database']['path']).parent
+    if not db_dir.exists():
+        print(f"Database directory not found: {db_dir}")
+        return
+
+    print("\nAvailable Databases:")
+    print("-" * 50)
+    for db_file in db_dir.glob("*.db"):
+        size = db_file.stat().st_size / 1024  # Convert to KB
+        print(f"Name: {db_file.name}")
+        print(f"Size: {size:.2f} KB")
+        print(f"Path: {db_file}")
+        print("-" * 50)
+
+def dump_database(db_path: Path, format: str, config):
+    """Dump database contents to CSV or JSON format."""
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        return
+
+    # Create output directory based on database name
+    db_name = db_path.stem
+    output_dir = Path(config['export']['output_dir']) / db_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+    try:
+        conn = sqlite3.connect(db_path, timeout=config['database']['timeout'])
+        cursor = conn.cursor()
+
+        # Get all tables in the database
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cursor.fetchall()
+
+        for (table_name,) in tables:
+            # Get table data
+            cursor.execute(f"SELECT * FROM {table_name}")
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+
+            if format == 'csv':
+                output_file = output_dir / f"{table_name}_{timestamp}.csv"
+                with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(columns)
+                    writer.writerows(rows)
+                print(f"Dumped {table_name} to {output_file}")
+            else:  # json
+                output_file = output_dir / f"{table_name}_{timestamp}.json"
+                # Convert rows to dictionaries and handle binary data
+                data = []
+                for row in rows:
+                    row_dict = {}
+                    for col, val in zip(columns, row):
+                        if isinstance(val, bytes):
+                            # Convert bytes to base64 string for JSON serialization
+                            row_dict[col] = base64.b64encode(val).decode('utf-8')
+                        else:
+                            row_dict[col] = val
+                    data.append(row_dict)
+                
+                with open(output_file, 'w', encoding='utf-8') as jsonfile:
+                    json.dump(data, jsonfile, indent=4, ensure_ascii=False)
+                print(f"Dumped {table_name} to {output_file}")
+
+        conn.close()
+        print(f"\nDatabase dump completed in: {output_dir}")
+
+    except sqlite3.Error as e:
+        print(f"Error dumping database: {e}")
+
 def check_database(args):
-    """Handle the 'database-check' command."""
+    """Handle the 'db' command."""
     repair = args.repair
     verbose = args.verbose
     config = args.config
     
     # Get database path from config
-    db_path = Path(config['database']['path'])
-    db_timeout = config['database']['timeout']
+    db_dir = Path(config['database']['path']).parent
+    
+    if args.db_name:
+        db_path = db_dir / f"{args.db_name}.db"
+    else:
+        db_path = Path(config['database']['path'])
+    
+    # Handle --list option
+    if args.list:
+        list_databases(config)
+        return
+    
+    # Handle --dump option
+    if args.dump:
+        dump_database(db_path, args.dump, config)
+        return
     
     if not db_path.exists():
         print(f"Database not found at {db_path}")
@@ -255,7 +347,7 @@ def check_database(args):
     # Check database integrity
     issues = []
     try:
-        conn = sqlite3.connect(db_path, timeout=db_timeout)
+        conn = sqlite3.connect(db_path, timeout=config['database']['timeout'])
         cursor = conn.cursor()
         
         # Check table structure
@@ -306,7 +398,7 @@ def check_database(args):
     if repair and issues:
         print("\nAttempting repairs...")
         try:
-            conn = sqlite3.connect(db_path, timeout=db_timeout)
+            conn = sqlite3.connect(db_path, timeout=config['database']['timeout'])
             cursor = conn.cursor()
             
             # Remove entries for missing files
