@@ -145,12 +145,13 @@ def list_tracked_files(db_path: Path, verbose: bool, timeout: int):
 
 def track_files(args):
     """Handle the 'track' command."""
-    paths = args.paths  # Changed from 'path' to 'paths' to reflect multiple inputs
+    paths = args.paths
     verbose = args.verbose
     config = args.config
 
     num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
-    db_path = Path(config['database']['path'])
+    cache_folder = Path(config.get("cache_folder", "cache log"))
+    db_path = cache_folder / "file_tracker.db"  # Use a separate database
     db_timeout = config['database']['timeout']
 
     initialize_database(db_path, db_timeout)
