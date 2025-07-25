@@ -6,7 +6,6 @@ from tqdm import tqdm
 import datetime
 from pathlib import Path
 import sqlite3
-import hashlib
 import threading
 import utils  # Import from root directory
 import fcntl  # For file-based locking
@@ -25,25 +24,34 @@ def release_lock(lock_fd):
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     lock_fd.close()
 
-def calculate_file_hash(file_path: str) -> str:
-    """Calculate the MD5 hash of a file."""
-    hasher = hashlib.md5()
-    with open(file_path, 'rb') as f:
-        while chunk := f.read(8192):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def backup_database(db_path: Path):
+    """Create a backup of the database before writing operations."""
+    if db_path.exists():
+        backup_path = db_path.with_suffix('.db.bak')
+        shutil.copy2(db_path, backup_path)
+        print(f"Created database backup at: {backup_path}")
 
 def initialize_database(db_path: Path):
-    """Initialize the SQLite database with WAL mode and busy timeout."""
+    """Initialize the SQLite database with WAL mode and busy timeout.
+    
+    Creates tables with file_path, mtime, status, and last_checked columns if they don't exist,
+    using mtime for caching decisions. Preserves existing tables and their data.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Create backup if database exists
+    backup_database(db_path)
+    
     conn = sqlite3.connect(db_path, timeout=5)  # 5-second busy timeout
     cursor = conn.cursor()
+    
     # Enable WAL mode for better concurrency
     cursor.execute("PRAGMA journal_mode=WAL")
+    
+    # Create tables if they don't exist, preserving any existing data
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS passed_files (
             file_path TEXT PRIMARY KEY,
-            file_hash TEXT,
             mtime REAL,
             status TEXT,
             last_checked TEXT
@@ -52,7 +60,6 @@ def initialize_database(db_path: Path):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS failed_files (
             file_path TEXT PRIMARY KEY,
-            file_hash TEXT,
             mtime REAL,
             status TEXT,
             last_checked TEXT
@@ -63,19 +70,22 @@ def initialize_database(db_path: Path):
     print(f"Database initialized with WAL mode at: {db_path}")
 
 def determine_action(db_path: Path, file_path: str, force_recheck: bool = False) -> tuple:
-    """Determine the action for a file with process-safe database access."""
+    """Determine the action for a file with process-safe database access.
+    
+    Uses only mtime to determine whether to use cached results or run a new check.
+    Returns a tuple of (action, stored_status, current_mtime).
+    """
     if force_recheck:
         try:
             current_mtime = os.path.getmtime(file_path)
-            current_hash = calculate_file_hash(file_path)
-            return 'RUN_FFMPEG', None, current_hash, current_mtime
+            return 'RUN_FFMPEG', None, current_mtime
         except FileNotFoundError:
-            return 'FILE_NOT_FOUND', None, None, None
+            return 'FILE_NOT_FOUND', None, None
 
     try:
         current_mtime = os.path.getmtime(file_path)
     except FileNotFoundError:
-        return 'FILE_NOT_FOUND', None, None, None
+        return 'FILE_NOT_FOUND', None, None
 
     # Use file-based locking for database access
     lock_fd = acquire_lock(LOCK_FILE)
@@ -83,24 +93,18 @@ def determine_action(db_path: Path, file_path: str, force_recheck: bool = False)
         conn = sqlite3.connect(db_path, timeout=5)
         cursor = conn.cursor()
         for table in ['passed_files', 'failed_files']:
-            cursor.execute(f"SELECT status, file_hash, mtime FROM {table} WHERE file_path = ?", (file_path,))
+            cursor.execute(f"SELECT status, mtime FROM {table} WHERE file_path = ?", (file_path,))
             result = cursor.fetchone()
             if result:
-                stored_status, stored_hash, stored_mtime = result
+                stored_status, stored_mtime = result
                 if stored_mtime == current_mtime:
                     conn.close()
-                    return 'USE_CACHED', stored_status, None, current_mtime
+                    return 'USE_CACHED', stored_status, current_mtime
                 else:
-                    current_hash = calculate_file_hash(file_path)
-                    if stored_hash == current_hash:
-                        conn.close()
-                        return 'UPDATE_MTIME', stored_status, current_hash, current_mtime
-                    else:
-                        conn.close()
-                        return 'RUN_FFMPEG', None, current_hash, current_mtime
+                    conn.close()
+                    return 'RUN_FFMPEG', None, current_mtime
         conn.close()
-        current_hash = calculate_file_hash(file_path)
-        return 'RUN_FFMPEG', None, current_hash, current_mtime
+        return 'RUN_FFMPEG', None, current_mtime
     finally:
         release_lock(lock_fd)
 
@@ -120,15 +124,16 @@ def check_single_file(file_path: str) -> tuple:
         return "FAILED", str(e), file_path
 
 def process_file(db_path: Path, file_path: str, force_recheck: bool = False) -> tuple:
-    """Process a file with coordinated database access."""
-    action, stored_status, current_hash, current_mtime = determine_action(db_path, file_path, force_recheck)
+    """Process a file with coordinated database access.
+    
+    Uses mtime-based caching to determine whether to run FFmpeg check.
+    """
+    action, stored_status, current_mtime = determine_action(db_path, file_path, force_recheck)
     if action == 'USE_CACHED':
         return ('USE_CACHED', stored_status, "Cached result", file_path, None)
-    elif action == 'UPDATE_MTIME':
-        return ('UPDATE_MTIME', stored_status, "Cached result (hash matches)", file_path, current_mtime)
     elif action == 'RUN_FFMPEG':
         status, message, _ = check_single_file(file_path)
-        update_info = (file_path, current_hash, current_mtime, status)
+        update_info = (file_path, current_mtime, status)
         return ('RUN_FFMPEG', status, message, file_path, update_info)
     else:
         return ('ERROR', "Unknown action", file_path, None)
@@ -174,13 +179,18 @@ def register_command(subparsers, config):
     parser.set_defaults(func=check_integrity, config=config)
 
 def check_integrity(args):
-    """Handle the 'check' command."""
+    """Handle the 'check' command.
+    
+    Uses mtime-based caching to determine whether to run FFmpeg checks,
+    creating a single database backup before any updates.
+    """
     path = args.path
     verbose = args.verbose
     config = args.config
     
     # Use config values with fallbacks
     num_workers = args.workers if args.workers is not None else config['processing']['max_workers']
+    db_path = Path(config['database']['path'])
 
     if os.path.isfile(path) and os.path.splitext(path)[1].lower() in utils.AUDIO_EXTENSIONS:
         audio_files = [path]
@@ -193,16 +203,60 @@ def check_integrity(args):
         print(f"'{path}' is not a file or directory.")
         return
 
-    # Process files
+    # Initialize database
+    initialize_database(db_path)
+
+    # Process files with parallel execution
     results = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(check_file_integrity, file) for file in audio_files]
+        futures = [executor.submit(process_file, db_path, file) for file in audio_files]
         with tqdm(total=len(futures), desc="Checking integrity") as pbar:
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
                 if result:
-                    results.append(result)
+                    action, status, message, file_path, update_info = result
+                    if action == 'USE_CACHED':
+                        results.append({
+                            'file_path': file_path,
+                            'ok': status == "PASSED",
+                            'error': ""
+                        })
+                    elif action == 'RUN_FFMPEG':
+                        results.append({
+                            'file_path': file_path,
+                            'ok': status == "PASSED",
+                            'error': message if status == "FAILED" else ""
+                        })
                     pbar.update(1)
+
+    # Update database with results - single backup for all updates
+    lock_fd = acquire_lock(LOCK_FILE)
+    try:
+        backup_database(db_path)  # Create single backup before batch update
+        conn = sqlite3.connect(db_path, timeout=5)
+        cursor = conn.cursor()
+        timestamp = datetime.datetime.now().isoformat()
+        
+        for result in results:
+            file_path = result['file_path']
+            status = "PASSED" if result['ok'] else "FAILED"
+            mtime = os.path.getmtime(file_path)
+            
+            # Remove from both tables first
+            cursor.execute("DELETE FROM passed_files WHERE file_path = ?", (file_path,))
+            cursor.execute("DELETE FROM failed_files WHERE file_path = ?", (file_path,))
+            
+            # Insert into appropriate table
+            table = "passed_files" if result['ok'] else "failed_files"
+            cursor.execute(f"""
+                INSERT INTO {table} (file_path, mtime, status, last_checked)
+                VALUES (?, ?, ?, ?)
+            """, (file_path, mtime, status, timestamp))
+        
+        conn.commit()
+        conn.close()
+    finally:
+        release_lock(lock_fd)
 
     # Print results
     if verbose:
